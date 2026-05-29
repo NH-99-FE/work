@@ -13,7 +13,7 @@ export function AccordionGroup({ group, onSelectTicket }: {
 }) {
   return (
     <div className="mb-2 bg-white rounded-xl overflow-hidden shadow-[0_1px_3px_rgba(0,0,0,0.06)]">
-      <Accordion type="multiple" defaultValue={[group.id]}>
+      <Accordion type="multiple" defaultValue={[]}>
         <AccordionItem value={group.id} className="border-b-0">
           <AccordionTrigger className="px-4 py-3 hover:no-underline hover:bg-gray-50/50 rounded-none">
             <div className="flex items-center gap-2.5 flex-1 min-w-0">

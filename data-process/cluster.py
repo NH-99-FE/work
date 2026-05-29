@@ -1,9 +1,9 @@
 """
-工单语义聚类脚本（LLM 主导）
+工单语义聚类脚本（Embedding + Agglomerative 聚类）
 1. 读取 Excel 工单数据
 2. 阶段一：LLM 为每条工单抽取「核心问题摘要」
-3. 阶段二：embedding 预聚合 + LLM 全局归并主题
-4. 阶段三：兜底分配 + 主题命名
+3. 阶段二：百度千帆 Embedding + Agglomerative 层次聚类
+4. 阶段三：LLM 批量命名
 5. 输出 JSON
 """
 
@@ -20,20 +20,24 @@ import httpx
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
+from sklearn.cluster import AgglomerativeClustering
 
 load_dotenv()
 
 API_KEY = os.getenv("OPENAI_API_KEY")
 BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
-EMBED_MODEL = os.getenv("EMBED_MODEL", "BAAI/bge-small-zh-v1.5")  # 本地 sentence-transformers 模型
+NAME_MODEL = os.getenv("NAME_MODEL", "gpt-4o")  # LLM 命名用的模型
+
+EMBED_API_KEY = os.getenv("EMBEDDING_API_KEY", "")
+EMBED_URL = os.getenv("EMBEDDING_URL", "https://qianfan.baidubce.com/v2/embeddings")
+EMBED_MODEL = os.getenv("EMBED_MODEL", "embedding-v1")
 
 EXCEL_DIR = Path(__file__).parent.parent / "data"
 OUTPUT_PATH = Path(__file__).parent.parent / "public" / "ticket_data.json"
 CACHE_DIR = Path(__file__).parent / ".cache"
 SUMMARY_CACHE = CACHE_DIR / "summaries.json"
-EMBED_CACHE = CACHE_DIR / "embeddings.npz"
-CLUSTER_CACHE = CACHE_DIR / "clusters.json"
+EMBED_CACHE = CACHE_DIR / f"embeddings_{EMBED_MODEL.replace('/', '_')}_v2.npz"
 
 EXCEL_FILES = sorted(EXCEL_DIR.glob("*.xlsx"))
 
@@ -41,21 +45,21 @@ SHEET_NAME = "工单数据"
 
 COL = {
     "id": 0, "type": 1, "title": 4, "phenomenon": 5,
-    "service_staff": 6, "status": 7, "channel": 8, "source": 9,
-    "ticket_type": 10, "category1": 11, "category2": 12,
+    "service_staff": 6, "status": 7, "source": 9,
+    "ticket_type": 10, "category1": 11,
     "satisfaction": 14, "feedback_time": 15,
     "response_time": 22, "process_duration": 23, "messages": 24,
 }
 
-GROUP_MIN = 5
-GROUP_MAX = 30
+GROUP_MIN = 2
+AGGLO_DISTANCE_THRESHOLD = 0.25  # 余弦距离阈值，< 此值归同一簇（0.25 ≈ 余弦相似度 0.75）
+BATCH_NAME_SIZE = 6   # LLM 命名每批簇数
 
 # 并发与批量
-SUMMARY_BATCH = 10        # 阶段一每批工单数
-LLM_CONCURRENCY = 20      # 全局 LLM 并发上限（所有阶段共享）
-MERGE_CHUNK = 80          # 阶段二每个 LLM 归并块的最大工单数
-EMBED_BATCH = 64          # 本地 embedding 批量
-SIM_THRESHOLD = 0.82      # embedding 预聚合阈值
+SUMMARY_BATCH = 20        # 阶段一每批工单数
+LLM_CONCURRENCY = 50      # 全局 LLM 并发上限
+EMBED_BATCH_API = 16      # 百度 embedding API 每批条数
+EMBED_CONCURRENCY = 30    # embedding API 并发上限
 HTTP_MAX_CONNECTIONS = 50 # httpx 连接池上限
 
 
@@ -140,21 +144,52 @@ def _clean_raw(text: str) -> str:
     return text
 
 
+def _clean_for_embed(text: str) -> str:
+    """比 _clean_raw 更强的清洗，用于 embedding 输入"""
+    text = _clean_raw(text)
+    text = re.sub(r"[\w.-]+@[\w.-]+", "", text)       # 去邮箱
+    text = re.sub(r"\b\d{6,}\b", "", text)             # 去纯数字 ID
+    text = re.sub(r"\bERR[_A-Z0-9]+\b", "", text)     # 去 ERR_XXX 报错码
+    text = re.sub(r"\b0x[0-9a-fA-F]+\b", "", text)    # 去 0xXXX 十六进制码
+    text = re.sub(r"\d{4}-\d{2}-\d{2}\s*\d{2}:\d{2}:\d{2}", "", text)  # 去时间戳
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
 def extract_raw_text_full(ticket: dict) -> str:
-    """完整原文（不截断），仅用于 hash"""
+    """完整原文（不截断），仅用于 hash。取标题+现象+提问者消息（不含客服和机器人）"""
     parts = []
     if ticket["title"]:
         parts.append(ticket["title"])
     if ticket["phenomenon"]:
         parts.append(ticket["phenomenon"])
-    user_msgs = [m["content"] for m in ticket["messages"] if m["role"] == "user"][:2]
-    parts.extend(user_msgs)
+    # 找提问者：第一条非 ROBOT 消息的发送者
+    questioner = None
+    for m in ticket["messages"]:
+        if m["role"] != "robot":
+            questioner = m["sender"]
+            break
+    if questioner:
+        for m in ticket["messages"]:
+            if m["sender"] == questioner:
+                parts.append(m["content"])
     return _clean_raw(" ".join(parts))
 
 
 def extract_raw_text(ticket: dict) -> str:
     """截断后的文本，喂给 LLM"""
     return extract_raw_text_full(ticket)[:600]
+
+
+def extract_embed_text(ticket: dict) -> str:
+    """用于 embedding 的文本：标题 + 现象，强清洗后截断"""
+    parts = []
+    if ticket["title"]:
+        parts.append(ticket["title"])
+    if ticket["phenomenon"]:
+        parts.append(ticket["phenomenon"])
+    text = " ".join(parts)
+    return _clean_for_embed(text)[:300]
 
 
 # ─── 缓存 ───────────────────────────────────────────────
@@ -201,82 +236,9 @@ def save_embed_cache(cache: dict[str, np.ndarray]) -> None:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     keys = np.array(list(cache.keys()))
     vecs = np.stack(list(cache.values())) if cache else np.zeros((0, 0), dtype=np.float32)
-    # 用 .npz 结尾的临时路径，避免 np.savez 自动追加扩展名导致 replace 找不到文件
     tmp = EMBED_CACHE.with_name(EMBED_CACHE.name + ".tmp.npz")
     np.savez(tmp, keys=keys, vecs=vecs)
     tmp.replace(EMBED_CACHE)
-
-
-def load_cluster_cache() -> dict[str, dict]:
-    """阶段二聚类结果缓存：key -> {themes, hashes_present}"""
-    if CLUSTER_CACHE.exists():
-        try:
-            with open(CLUSTER_CACHE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            print(f"  📁 命中阶段二缓存：{len(data)} 个分类")
-            return data
-        except Exception as e:
-            print(f"  ⚠️ 阶段二缓存损坏，忽略：{e}")
-    return {}
-
-
-def save_cluster_cache(cache: dict[str, dict]) -> None:
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = CLUSTER_CACHE.with_suffix(".json.tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(cache, f, ensure_ascii=False)
-    tmp.replace(CLUSTER_CACHE)
-
-
-def cluster_cache_key(category: str, tickets: list[dict]) -> str:
-    """缓存 key：分类名 + 该分类下所有工单 hash + core_issue 的稳定签名"""
-    parts = sorted(
-        f"{t['_hash']}|{t['_summary'].get('core_issue', '')}" for t in tickets
-    )
-    body = category + "::" + "\n".join(parts)
-    return text_hash(body)
-
-
-_LOCAL_EMBED_MODEL = None
-
-
-def _get_local_embed_model():
-    """惰性加载本地 embedding 模型（首次使用时下载/加载，之后复用）"""
-    global _LOCAL_EMBED_MODEL
-    if _LOCAL_EMBED_MODEL is None:
-        from sentence_transformers import SentenceTransformer
-        print(f"  🔄 加载本地 embedding 模型: {EMBED_MODEL}（首次会下载到 ~/.cache/huggingface）")
-        _LOCAL_EMBED_MODEL = SentenceTransformer(EMBED_MODEL)
-    return _LOCAL_EMBED_MODEL
-
-
-def compute_embeddings_cached(texts: list[str]) -> np.ndarray:
-    """对 texts 求 embedding：本地模型 + 缓存。命中则跳过，未命中批量计算后落盘。"""
-    cache = load_embed_cache()
-    hashes = [text_hash(t) for t in texts]
-    miss_idx = [i for i, h in enumerate(hashes) if h not in cache]
-    print(f"  embedding 缓存命中 {len(texts) - len(miss_idx)}/{len(texts)}，待计算 {len(miss_idx)} 条")
-
-    if miss_idx:
-        model = _get_local_embed_model()
-        miss_texts = [texts[i] for i in miss_idx]
-        # sentence-transformers 自带批处理 + 进度条
-        vecs = model.encode(
-            miss_texts,
-            batch_size=EMBED_BATCH,
-            normalize_embeddings=True,
-            show_progress_bar=True,
-            convert_to_numpy=True,
-        ).astype(np.float32)
-        for k, idx in enumerate(miss_idx):
-            cache[hashes[idx]] = vecs[k]
-        save_embed_cache(cache)
-
-    if not cache:
-        raise RuntimeError("embedding 全部失败，无法继续")
-
-    arr = np.stack([cache[h] for h in hashes]).astype(np.float32)
-    return arr
 
 
 # ─── LLM / Embedding HTTP 封装 ──────────────────────────
@@ -288,34 +250,70 @@ class LLMClient:
             max_keepalive_connections=HTTP_MAX_CONNECTIONS,
         )
         self.client = httpx.AsyncClient(timeout=120, limits=limits, http2=False)
-        self.headers = {
-            "Authorization": f"Bearer {API_KEY}",
-            "Content-Type": "application/json",
-        }
         self.llm_sem = asyncio.Semaphore(LLM_CONCURRENCY)
+        self.embed_sem = asyncio.Semaphore(EMBED_CONCURRENCY)
 
-    async def chat(self, prompt: str, temperature: float = 0.2, response_json: bool = False) -> str:
+    # ── LLM chat ──
+
+    async def chat(self, prompt: str, temperature: float = 0.2, response_json: bool = False, model: str | None = None) -> str:
+        use_model = model or MODEL
+        # Kimi-K2.x 系列只接受 temperature=1
+        actual_temp = 1.0 if use_model.startswith("Kimi") else temperature
         payload = {
-            "model": MODEL,
+            "model": use_model,
             "messages": [{"role": "user", "content": prompt}],
-            "temperature": temperature,
+            "temperature": actual_temp,
         }
         if response_json:
             payload["response_format"] = {"type": "json_object"}
         async with self.llm_sem:
-            resp = await self._post_with_retry(f"{BASE_URL}/chat/completions", payload)
+            resp = await self._post_with_retry(
+                f"{BASE_URL}/chat/completions",
+                payload,
+                headers_override={
+                    "Authorization": f"Bearer {API_KEY}",
+                    "Content-Type": "application/json",
+                },
+            )
             return resp.json()["choices"][0]["message"]["content"]
 
-    async def _post_with_retry(self, url: str, payload: dict, max_attempts: int = 5) -> httpx.Response:
-        """对 5xx / 429 / 网络异常做指数退避"""
+    # ── 百度千帆 Embedding API ──
+
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        """调用百度千帆 embedding API，返回与输入等长的 embedding 列表"""
+        async with self.embed_sem:
+            resp = await self._post_with_retry(
+                EMBED_URL,
+                {"model": EMBED_MODEL, "input": texts},
+                headers_override={
+                    "Authorization": f"Bearer {EMBED_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+            )
+            data = resp.json()
+            results = sorted(data["data"], key=lambda x: x["index"])
+            return [r["embedding"] for r in results]
+
+    # ── 通用带重试 POST ──
+
+    async def _post_with_retry(
+        self,
+        url: str,
+        payload: dict,
+        max_attempts: int = 5,
+        headers_override: dict | None = None,
+    ) -> httpx.Response:
+        headers = headers_override or {
+            "Authorization": f"Bearer {API_KEY}",
+            "Content-Type": "application/json",
+        }
         last_err: Exception | None = None
         for attempt in range(max_attempts):
             try:
-                resp = await self.client.post(url, headers=self.headers, json=payload)
+                resp = await self.client.post(url, headers=headers, json=payload)
                 if resp.status_code < 500 and resp.status_code != 429:
                     resp.raise_for_status()
                     return resp
-                # 5xx / 429 → 重试
                 last_err = httpx.HTTPStatusError(
                     f"{resp.status_code} {resp.reason_phrase}", request=resp.request, response=resp,
                 )
@@ -336,12 +334,10 @@ def parse_json_loose(text: str):
     m = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
     if m:
         text = m.group(1)
-    # 尝试整体解析
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
-    # 退化：找第一个 { 或 [ 到对应的最后一个 } 或 ]
     for open_c, close_c in [("[", "]"), ("{", "}")]:
         i = text.find(open_c)
         j = text.rfind(close_c)
@@ -355,14 +351,21 @@ def parse_json_loose(text: str):
 
 # ─── 阶段一：抽取问题摘要 ───────────────────────────────
 
-SUMMARY_PROMPT_TEMPLATE = """你是工单分析师。请为下列工单抽取「核心问题」摘要，用于后续聚类。
+SUMMARY_PROMPT_TEMPLATE = """你是工单分析师。请为下列工单抽取核心问题摘要，用于后续语义聚类。
 
 要求：
-- core_issue：一句话描述用户遇到的核心问题，10-25 字，去掉环境/账号/时间等具体细节，保留问题本质。例如「插件升级后无法启动」「反馈接口返回 401」「文档同步失败」。
-- keywords：3-6 个关键词（中文/英文均可），覆盖产品/动作/异常表现。
+- core_issue：一句话概括工单的核心主题，15-35 字。必须包含产品/功能名 + 具体场景 + 问题或诉求。去掉账号/时间/版本号等细节，保留问题本质。
+  好的示例：「Comate网页版切换GPT模型时审批弹窗无法跳过」「ducc更新后重启时插件冲突致会话不显示」「iCoding开发机非root用户无法登录」「OneAPI请求deepseek-v4-pro模型时提示无可用渠道」
+  不好的示例：「显示异常」（缺少产品和场景）、「咨询问题」（什么都没说）、「无法启动」（缺少产品和场景）、「用户反馈问题」（太笼统）
+- 禁止使用「咨询」「询问」「了解」「求问」等空洞标签。这些词会让不同主题的工单错误地互相靠近，必须替换为具体主题：
+  用户问"是否支持X"→写"X的支持情况"（如"Comate访问百度内网地址的支持情况"）；
+  问"怎么操作Y"→写"Y的操作方式"（如"Comate IDE进入Mission Mode的操作方式"）；
+  问"如何配置Z"→写"Z的配置方式"（如"ducc切换计费账号的配置方式"）；
+  如果用户明确在抱怨X不可用，才写"X不可用/无法X"。不要把咨询扭曲成问题。
+- 产品名必须具体：不能只写"API""账户""客户端"，必须写明是哪个产品的，如"Comate API""ducc账户""iCoding客户端"。
 - 不要复述原文，要做归纳。
 
-输出严格 JSON：{{"results": [{{"id": "<原 id>", "core_issue": "...", "keywords": ["...", "..."]}}, ...]}}
+输出严格 JSON：{{"results": [{{"id": "<原 id>", "core_issue": "..."}}, ...]}}
 
 工单列表：
 {items}
@@ -370,7 +373,7 @@ SUMMARY_PROMPT_TEMPLATE = """你是工单分析师。请为下列工单抽取「
 
 
 async def summarize_batch(llm: LLMClient, batch: list[dict]) -> dict[str, dict]:
-    """对一批工单调用 LLM 抽取摘要，返回 {id: {core_issue, keywords}}"""
+    """对一批工单调用 LLM 抽取摘要，返回 {id: {core_issue}}"""
     items = "\n".join(
         f"id={t['_sid']}: {extract_raw_text(t) or '(无内容)'}"
         for t in batch
@@ -387,7 +390,6 @@ async def summarize_batch(llm: LLMClient, batch: list[dict]) -> dict[str, dict]:
                 if sid:
                     out[sid] = {
                         "core_issue": str(r.get("core_issue", "")).strip(),
-                        "keywords": r.get("keywords", []) or [],
                     }
             return out
         except Exception as e:
@@ -444,564 +446,324 @@ async def summarize_all(llm: LLMClient, tickets: list[dict]) -> None:
     miss = 0
     for t in tickets:
         if "_summary" not in t:
-            t["_summary"] = {"core_issue": t["_raw"][:40], "keywords": []}
+            t["_summary"] = {"core_issue": t["_raw"][:30]}
             miss += 1
     if miss:
         print(f"  ⚠️ {miss} 条未成功抽取摘要，已用原文兜底（未写入缓存）")
 
-    # _hash 后续阶段二缓存还要用，留到 main 末尾再清理
     for t in tickets:
         t.pop("_raw", None)
 
 
-# ─── 阶段二：embedding 预聚合 + LLM 归并 ────────────────
+# ─── 阶段二：百度千帆 Embedding ─────────────────────────
 
-def union_find_clusters(sim: np.ndarray, threshold: float) -> list[list[int]]:
-    """按相似度阈值做 union-find 粗聚合"""
-    n = sim.shape[0]
-    parent = list(range(n))
+async def compute_embeddings_api(llm: LLMClient, texts: list[str]) -> np.ndarray:
+    """通过百度千帆 API 计算 embedding，带缓存。返回 L2 归一化后的向量矩阵。"""
+    cache = load_embed_cache()
+    hashes = [text_hash(t) for t in texts]
+    miss_idx = [i for i, h in enumerate(hashes) if h not in cache]
+    print(f"  embedding 缓存命中 {len(texts) - len(miss_idx)}/{len(texts)}，待计算 {len(miss_idx)} 条")
 
-    def find(x):
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
+    if miss_idx:
+        batches = [miss_idx[i:i + EMBED_BATCH_API] for i in range(0, len(miss_idx), EMBED_BATCH_API)]
+        print(f"  → {len(batches)} 批 API 调用，并发 {EMBED_CONCURRENCY}")
 
-    def union(a, b):
-        ra, rb = find(a), find(b)
-        if ra != rb:
-            parent[ra] = rb
+        # 按批次并发调用 API
+        batch_map: dict[int, list[list[float]]] = {}
 
-    # 矢量化提取上三角中相似度过阈的对
-    mask = np.triu(sim >= threshold, k=1)
-    ii, jj = np.where(mask)
-    for i, j in zip(ii.tolist(), jj.tolist()):
-        union(i, j)
+        async def fetch_batch(batch_idx: int, b: list[int]):
+            batch_texts = [texts[j] for j in b]
+            result = await llm.embed(batch_texts)
+            batch_map[batch_idx] = result
 
-    groups: dict[int, list[int]] = {}
-    for i in range(n):
-        r = find(i)
-        groups.setdefault(r, []).append(i)
-    return list(groups.values())
+        await asyncio.gather(*(fetch_batch(i, b) for i, b in enumerate(batches)))
 
+        # 写入缓存
+        for batch_idx, b in enumerate(batches):
+            result = batch_map[batch_idx]
+            for k, idx in enumerate(b):
+                cache[hashes[idx]] = np.array(result[k], dtype=np.float32)
 
-MERGE_PROMPT_TEMPLATE = """你是数据分析师，需要把同一类目下的工单按「具体问题」归并成主题。
+        save_embed_cache(cache)
 
-类目：{category}
+    if not cache:
+        raise RuntimeError("embedding 全部失败，无法继续")
 
-工单核心问题列表（id: 摘要）：
-{items}
-
-任务：
-1. 把语义相同/相近的工单合并到同一主题。同义不同形（如「无法启动」「打不开」「启动失败」）必须合并。
-2. 每个主题至少 {gmin} 条、至多 {gmax} 条；若某主题超过 {gmax}，请按更细粒度拆分。
-3. 不要使用「其他问题」「综合问题」等宽泛名称。
-4. 主题名 8-16 字，可用斜杠连接相关概念。
-5. 描述一句话概括典型表现。
-
-输出严格 JSON：
-{{
-  "themes": [
-    {{
-      "name": "主题名",
-      "description": "一句话描述",
-      "id_suffix": "english-kebab-case",
-      "ticket_ids": ["t3","t8",...]
-    }},
-    ...
-  ]
-}}
-所有给出的 id 必须出现且仅出现一次。"""
+    arr = np.stack([cache[h] for h in hashes]).astype(np.float32)
+    # L2 归一化：之后用欧式距离等价于余弦距离
+    norms = np.linalg.norm(arr, axis=1, keepdims=True)
+    norms = np.clip(norms, 1e-9, None)
+    arr = arr / norms
+    return arr
 
 
-async def llm_merge_chunk(llm: LLMClient, category: str, tickets: list[dict]) -> list[dict]:
-    """对一个 chunk 的工单做 LLM 主题归并"""
-    items = "\n".join(f"{t['_sid']}: {t['_summary']['core_issue']}" for t in tickets)
-    prompt = MERGE_PROMPT_TEMPLATE.format(
-        category=category, items=items, gmin=GROUP_MIN, gmax=GROUP_MAX,
+# ─── Agglomerative 层次聚类 ────────────────────────────────
+
+def agglomerative_cluster(embeddings: np.ndarray, distance_threshold: float = AGGLO_DISTANCE_THRESHOLD) -> np.ndarray:
+    """Agglomerative 层次聚类，按余弦距离阈值切割。返回标签数组。"""
+    clusterer = AgglomerativeClustering(
+        n_clusters=None,
+        distance_threshold=distance_threshold,
+        metric="cosine",
+        linkage="average",
     )
-    for attempt in range(2):
-        try:
-            content = await llm.chat(prompt, temperature=0.2, response_json=True)
-            data = parse_json_loose(content)
-            themes = data.get("themes", []) if isinstance(data, dict) else data
-            return themes
-        except Exception as e:
-            if attempt == 1:
-                print(f"      主题归并失败（已重试）：{e}")
-                return []
-            await asyncio.sleep(1)
-    return []
+    return clusterer.fit_predict(embeddings)
 
 
-THEME_DEDUP_PROMPT = """以下是同一类目「{category}」下的多个候选主题（来自不同分块的归并结果）。
-请识别其中**实际指代同一问题**的主题并合并。
+def merge_similar_clusters(labels: np.ndarray, embeddings: np.ndarray,
+                           threshold: float = 0.85) -> np.ndarray:
+    """合并质心余弦相似度超过阈值的簇（Agglomerative 可能拆出语义相同的小簇）"""
+    labels = labels.copy()
+    unique_labels = sorted(set(labels))
+    if len(unique_labels) <= 1:
+        return labels
 
-候选主题列表（编号: 名称 - 描述）：
-{items}
+    # 计算每个簇的归一化质心
+    centroids = {}
+    for l in unique_labels:
+        c = embeddings[labels == l].mean(axis=0)
+        n = np.linalg.norm(c)
+        centroids[l] = c / n if n > 0 else c
 
-要求：
-1. 同义不同形（如「无法启动」「打不开」「启动失败」）必须合并为一个主题。
-2. 不同问题保持独立，不要过度合并。
-3. 输出 JSON：每个合并后的主题给出 group_name、group_description，以及包含的候选主题编号列表。
+    changed = True
+    while changed:
+        changed = False
+        current_labels = sorted(set(labels))
+        if len(current_labels) <= 1:
+            break
 
-输出严格 JSON：
-{{
-  "merged": [
-    {{"group_name": "主题名", "group_description": "一句话描述", "members": [1, 5, 12]}},
-    ...
-  ]
-}}
-所有候选编号必须出现且仅出现一次。"""
+        # 重新计算当前簇的质心
+        centroids = {}
+        for l in current_labels:
+            c = embeddings[labels == l].mean(axis=0)
+            n = np.linalg.norm(c)
+            centroids[l] = c / n if n > 0 else c
 
+        # 找最相似的一对
+        best_sim = -1
+        best_pair = None
+        for i, la in enumerate(current_labels):
+            for lb in current_labels[i + 1:]:
+                sim = float(centroids[la] @ centroids[lb])
+                if sim > best_sim:
+                    best_sim = sim
+                    best_pair = (la, lb)
 
-async def llm_dedup_themes(llm: LLMClient, category: str, themes: list[dict]) -> list[list[int]]:
-    """让 LLM 识别同义主题，返回成员索引分组列表（每个内层列表是合并到同一主题的原 theme idx）"""
-    if len(themes) <= 1:
-        return [[i] for i in range(len(themes))]
-
-    items = "\n".join(
-        f"{i + 1}: {t.get('name', '').strip()} - {t.get('description', '').strip()}"
-        for i, t in enumerate(themes)
-    )
-    prompt = THEME_DEDUP_PROMPT.format(category=category, items=items)
-    try:
-        content = await llm.chat(prompt, temperature=0.1, response_json=True)
-        data = parse_json_loose(content)
-        merged = data.get("merged", []) if isinstance(data, dict) else data
-        groups: list[list[int]] = []
-        seen: set[int] = set()
-        for m in merged:
-            members = m.get("members", []) or []
-            idxs = []
-            for x in members:
-                try:
-                    j = int(x) - 1
-                except (TypeError, ValueError):
-                    continue
-                if 0 <= j < len(themes) and j not in seen:
-                    idxs.append(j)
-                    seen.add(j)
-            if idxs:
-                # 把合并后的名称/描述写回第一个 theme，后续直接用
-                themes[idxs[0]]["name"] = str(m.get("group_name", "")).strip() or themes[idxs[0]].get("name", "")
-                themes[idxs[0]]["description"] = str(m.get("group_description", "")).strip() or themes[idxs[0]].get("description", "")
-                groups.append(idxs)
-        # 兜底：未出现的 theme 各自独立
-        for i in range(len(themes)):
-            if i not in seen:
-                groups.append([i])
-        return groups
-    except Exception as e:
-        print(f"      主题去重失败，跳过：{e}")
-        return [[i] for i in range(len(themes))]
-
-
-def split_by_embedding_chunks(tickets: list[dict], embeddings: np.ndarray, target_chunk: int) -> list[list[int]]:
-    """
-    将 tickets 按 embedding 相似度预聚合成块，每块 ≤ target_chunk。
-    单个超大簇用 KMeans-lite（按种子最远点）切分。
-    """
-    n = len(tickets)
-    if n <= target_chunk:
-        return [list(range(n))]
-
-    sim = embeddings @ embeddings.T
-    raw_groups = union_find_clusters(sim, SIM_THRESHOLD)
-
-    chunks: list[list[int]] = []
-    pending: list[int] = []
-    for g in sorted(raw_groups, key=len, reverse=True):
-        if len(g) > target_chunk:
-            # 用相似度做贪心切分
-            remaining = set(g)
-            while remaining:
-                seed = next(iter(remaining))
-                # 取与 seed 最相似的 target_chunk-1 个
-                cand = sorted(remaining, key=lambda x: -sim[seed, x])[:target_chunk]
-                chunks.append(cand)
-                remaining -= set(cand)
-        else:
-            if len(pending) + len(g) <= target_chunk:
-                pending.extend(g)
+        if best_sim >= threshold and best_pair:
+            # 把较小的簇合并到较大的簇
+            la, lb = best_pair
+            size_a = np.sum(labels == la)
+            size_b = np.sum(labels == lb)
+            if size_a >= size_b:
+                labels[labels == lb] = la
             else:
-                if pending:
-                    chunks.append(pending)
-                pending = list(g)
-    if pending:
-        chunks.append(pending)
-    return chunks
+                labels[labels == la] = lb
+            changed = True
+
+    return labels
+
+BATCH_NAME_PROMPT_TEMPLATE = """根据每个簇内的工单摘要，为该簇起一个标题。
+
+规则：
+- 标题 8-16 字，必须包含产品名+具体问题，不要斜杠
+- 必须从摘要内容归纳，禁止凭空发挥
+- 不同簇的标题必须不同
+
+好的标题示例：「Comate切换模型时审批弹窗无法跳过」「ducc重启后会话记录不显示」「iCoding开发机非root无法登录」「OneAPI请求DeepSeek模型时无可用渠道」
+不好的标题：「功能异常」「使用问题」「模型相关」「无法使用」—— 这些太笼统，没有信息量。
+
+{clusters_text}
+
+输出严格 JSON：
+{{"themes": [{{"index": 1, "name": "标题", "id_suffix": "english-kebab-case"}}, ...]}}"""
+
+SINGLE_NAME_PROMPT_TEMPLATE = """根据以下工单摘要，起一个标题。
+
+规则：
+- 标题 8-16 字，必须包含产品名+具体问题，不要斜杠
+- 必须从摘要内容归纳，禁止凭空发挥
+
+好的标题示例：「Comate切换模型时审批弹窗无法跳过」「ducc重启后会话记录不显示」「iCoding开发机非root无法登录」
+不好的标题：「功能异常」「使用问题」「模型相关」「无法使用」—— 太笼统。
+
+{items}
+
+输出严格 JSON：{{"name": "标题", "id_suffix": "english-kebab-case"}}"""
 
 
-async def cluster_category_llm(
+def _ticket_summary_line(t: dict) -> str:
+    """取工单的摘要行，用于命名 prompt"""
+    if "_summary" in t and t["_summary"].get("core_issue"):
+        return t["_summary"]["core_issue"]
+    return t.get("title", "") or "(无内容)"
+
+
+async def llm_name_batch(
+    llm: LLMClient,
+    groups_info: list[tuple[int, int, list[dict]]],
+) -> dict[int, dict]:
+    """批量命名多个簇。返回 {原index: {name, id_suffix}}"""
+    if not groups_info:
+        return {}
+
+    # 单簇时走单簇模板
+    if len(groups_info) == 1:
+        idx, _, tickets = groups_info[0]
+        result = await llm_name_group(llm, tickets)
+        return {idx: result}
+
+    clusters_text_parts = []
+    for i, (_, count, tickets) in enumerate(groups_info):
+        items = "\n".join(f"  - {_ticket_summary_line(t)}" for t in tickets[:15])
+        clusters_text_parts.append(f"簇{i + 1}（{count}条工单）：\n{items}")
+
+    clusters_text = "\n\n".join(clusters_text_parts)
+    prompt = BATCH_NAME_PROMPT_TEMPLATE.format(clusters_text=clusters_text)
+
+    try:
+        content = await llm.chat(prompt, temperature=0.2, response_json=True, model=NAME_MODEL)
+        data = parse_json_loose(content)
+        themes = data.get("themes", []) if isinstance(data, dict) else data
+
+        results: dict[int, dict] = {}
+        for theme in themes:
+            try:
+                batch_idx = int(theme.get("index", 0)) - 1
+            except (TypeError, ValueError):
+                continue
+            if 0 <= batch_idx < len(groups_info):
+                orig_idx = groups_info[batch_idx][0]
+                results[orig_idx] = {
+                    "name": str(theme.get("name", "")).strip(),
+                    "id_suffix": str(theme.get("id_suffix", "")).strip(),
+                }
+
+        # 兜底：未命名的簇逐个补
+        missing = [(idx, count, tickets) for idx, count, tickets in groups_info if idx not in results]
+        if missing:
+            print(f"      批量命名有 {len(missing)} 个簇缺失，逐个补命名...")
+            for idx, _, tickets in missing:
+                results[idx] = await llm_name_group(llm, tickets)
+
+        return results
+    except Exception as e:
+        print(f"      批量命名失败：{e}，回退逐个命名...")
+        results: dict[int, dict] = {}
+        for idx, _, tickets in groups_info:
+            results[idx] = await llm_name_group(llm, tickets)
+        return results
+
+
+async def llm_name_group(llm: LLMClient, tickets: list[dict]) -> dict:
+    """让 LLM 为一组工单生成主题名（单簇命名，也作批量兜底）"""
+    items = "\n".join(
+        f"- {_ticket_summary_line(t)}" for t in tickets[:30]
+    )
+    prompt = SINGLE_NAME_PROMPT_TEMPLATE.format(items=items)
+    try:
+        content = await llm.chat(prompt, temperature=0.2, response_json=True, model=NAME_MODEL)
+        data = parse_json_loose(content)
+        return {
+            "name": str(data.get("name", "")).strip(),
+            "id_suffix": str(data.get("id_suffix", "")).strip(),
+        }
+    except Exception as e:
+        print(f"      命名失败：{e}")
+        return {"name": "", "id_suffix": ""}
+
+
+# ─── 聚类主逻辑 ─────────────────────────────────────────
+
+async def cluster_category(
     llm: LLMClient,
     category: str,
     tickets: list[dict],
     embeddings: np.ndarray,
-    cluster_cache: dict | None = None,
 ) -> list[dict]:
-    """对一个一级分类下的工单做 LLM 主导的聚类"""
+    """对一个一级分类下的工单做 Agglomerative 聚类 + LLM 命名"""
     n = len(tickets)
     if n < GROUP_MIN:
+        name_result = await llm_name_group(llm, tickets) if n > 0 else {}
+        suffix = name_result.get("id_suffix") or "general"
         return [{
-            "id": f"{category}-general",
-            "name": "通用问题",
-            "description": "该分类下工单数量较少，统一归组",
+            "id": f"{category}-{suffix}",
+            "name": name_result.get("name") or "通用问题",
             "count": n,
             "tickets": tickets,
         }]
 
-    sid_to_ticket = {t["_sid"]: t for t in tickets}
-    sid_to_idx = {t["_sid"]: i for i, t in enumerate(tickets)}
-    hash_to_sid = {t["_hash"]: t["_sid"] for t in tickets}
+    # 1. Agglomerative 层次聚类
+    labels = agglomerative_cluster(embeddings)
 
-    # 0. 先看阶段二缓存
-    cache_key = cluster_cache_key(category, tickets)
-    cached = (cluster_cache or {}).get(cache_key)
-    if cached:
-        print(f"    📁 命中阶段二缓存，跳过 LLM")
-        theme_meta = cached["theme_meta"]
-        assignments_by_hash = cached["assignments"]
-        # 把 hash→theme_key 翻译成 sid→theme_key
-        assigned = {
-            hash_to_sid[h]: tk
-            for h, tk in assignments_by_hash.items()
-            if h in hash_to_sid
-        }
-        # 兜底：缓存里没有的 hash（理论上不应发生，因为 cache_key 已锁定集合）
-        for t in tickets:
-            if t["_sid"] not in assigned:
-                assigned[t["_sid"]] = "fallback"
-                theme_meta.setdefault("fallback", {
-                    "name": "未分类问题",
-                    "description": "缓存重放时未匹配，统一归组",
-                    "suffix": "uncategorized",
-                })
-    else:
-        # 1. 切块（让单次 LLM 归并不过长）
-        chunks = split_by_embedding_chunks(tickets, embeddings, MERGE_CHUNK)
-        print(f"    embedding 预聚合 → {len(chunks)} 块")
+    # 2. 合并相似簇（Agglomerative 可能拆出语义相同的小簇）
+    before_merge = len(set(labels))
+    labels = merge_similar_clusters(labels, embeddings)
+    after_merge = len(set(labels))
+    if before_merge != after_merge:
+        print(f"    相似簇合并: {before_merge} → {after_merge}")
 
-        # 2. 每块跑 LLM 归并（共享全局 LLM 信号量）
-        all_themes: list[dict] = []
+    # 3. LLM 批量命名
+    unique_labels = sorted(set(labels))
+    print(f"    Agglomerative → {len(unique_labels)} 组，开始命名...")
 
-        async def run_chunk(idxs: list[int]) -> list[dict]:
-            sub = [tickets[i] for i in idxs]
-            return await llm_merge_chunk(llm, category, sub)
+    # 构建每簇信息：(簇在 unique_labels 中的序号, 工单数, 工单列表)
+    groups_info: list[tuple[int, int, list[dict]]] = []
+    label_to_idx: dict[int, int] = {}
+    for i, l in enumerate(unique_labels):
+        group_idx_arr = np.where(labels == l)[0]
+        group_tickets = [tickets[j] for j in group_idx_arr]
+        label_to_idx[l] = i
+        groups_info.append((i, len(group_tickets), group_tickets))
 
-        chunk_results = await asyncio.gather(*(run_chunk(ix) for ix in chunks))
-        for themes in chunk_results:
-            all_themes.extend(themes)
+    # 分批（每批 BATCH_NAME_SIZE 个簇），各批并发
+    batches = [
+        groups_info[i:i + BATCH_NAME_SIZE]
+        for i in range(0, len(groups_info), BATCH_NAME_SIZE)
+    ]
+    print(f"    命名分 {len(batches)} 批（每批 ≤{BATCH_NAME_SIZE} 簇），并发执行...")
 
-        # 2.5. 跨 chunk 同义主题二次合并
-        if len(chunks) > 1 and len(all_themes) > 1:
-            dedup_groups = await llm_dedup_themes(llm, category, all_themes)
-            if dedup_groups:
-                new_themes: list[dict] = []
-                for group in dedup_groups:
-                    if not group:
-                        continue
-                    primary = all_themes[group[0]]
-                    merged_ticket_ids: list[str] = []
-                    for j in group:
-                        merged_ticket_ids.extend(all_themes[j].get("ticket_ids", []) or [])
-                    primary = dict(primary)  # 浅拷贝
-                    primary["ticket_ids"] = merged_ticket_ids
-                    new_themes.append(primary)
-                print(f"    跨 chunk 主题合并: {len(all_themes)} → {len(new_themes)}")
-                all_themes = new_themes
+    batch_results = await asyncio.gather(
+        *(llm_name_batch(llm, b) for b in batches)
+    )
 
-        # 3. 收集分配 + 兜底未分配
-        assigned: dict[str, str] = {}  # sid -> theme_key
-        theme_meta: dict[str, dict] = {}  # theme_key -> {name, description, suffix}
-        for t_idx, theme in enumerate(all_themes):
-            key = f"th{t_idx}"
-            raw_suffix = str(theme.get("id_suffix", "")).strip() or "theme"
-            unique_suffix = f"{raw_suffix}-{t_idx + 1}"
-            theme_meta[key] = {
-                "name": str(theme.get("name", "")).strip() or f"主题{t_idx + 1}",
-                "description": str(theme.get("description", "")).strip(),
-                "suffix": unique_suffix,
-            }
-            for sid in theme.get("ticket_ids", []) or []:
-                sid = str(sid).strip()
-                if sid in sid_to_ticket and sid not in assigned:
-                    assigned[sid] = key
+    # 合并结果
+    name_map: dict[int, dict] = {}
+    for br in batch_results:
+        name_map.update(br)
 
-        missing = [t for t in tickets if t["_sid"] not in assigned]
-        if missing:
-            def is_zero(emb: np.ndarray) -> bool:
-                return float(np.linalg.norm(emb)) < 1e-6
-
-            valid_missing = [t for t in missing if not is_zero(embeddings[sid_to_idx[t["_sid"]]])]
-            zero_missing = [t for t in missing if is_zero(embeddings[sid_to_idx[t["_sid"]]])]
-
-            if valid_missing:
-                emb_bucket: dict[str, list[np.ndarray]] = {}
-                for sid, key in assigned.items():
-                    emb = embeddings[sid_to_idx[sid]]
-                    if not is_zero(emb):
-                        emb_bucket.setdefault(key, []).append(emb)
-                centroids = {k: np.mean(np.stack(v), axis=0) for k, v in emb_bucket.items() if v}
-                if centroids:
-                    keys = list(centroids.keys())
-                    cmat = np.stack([centroids[k] for k in keys])
-                    cmat = cmat / np.clip(np.linalg.norm(cmat, axis=1, keepdims=True), 1e-9, None)
-                    for t in valid_missing:
-                        v = embeddings[sid_to_idx[t["_sid"]]]
-                        sims = cmat @ v
-                        best = keys[int(np.argmax(sims))]
-                        assigned[t["_sid"]] = best
-                else:
-                    zero_missing.extend(valid_missing)
-                    valid_missing = []
-
-            if zero_missing or (not assigned):
-                theme_meta["fallback"] = {
-                    "name": "未分类问题",
-                    "description": "embedding 或 LLM 主题归并失败，统一归组",
-                    "suffix": "uncategorized",
-                }
-                for t in zero_missing:
-                    assigned[t["_sid"]] = "fallback"
-                for t in missing:
-                    if t["_sid"] not in assigned:
-                        assigned[t["_sid"]] = "fallback"
-
-        # 写入阶段二缓存（key 已绑定到此 category 的工单集合 + core_issue）
-        if cluster_cache is not None:
-            sid_to_hash = {t["_sid"]: t["_hash"] for t in tickets}
-            cluster_cache[cache_key] = {
-                "theme_meta": theme_meta,
-                "assignments": {sid_to_hash[sid]: tk for sid, tk in assigned.items()},
-            }
-
-    # 4. 组装组
-    ticket_bucket: dict[str, list[dict]] = {}
-    for sid, key in assigned.items():
-        ticket_bucket.setdefault(key, []).append(sid_to_ticket[sid])
-
+    # 6. 组装结果
     groups: list[dict] = []
-    for key, ts in ticket_bucket.items():
-        meta = theme_meta.get(key, {"name": "未分类", "description": "", "suffix": key})
+    for l in unique_labels:
+        group_idx = np.where(labels == l)[0]
+        group_tickets = [tickets[i] for i in group_idx]
+        idx = label_to_idx[l]
+        name_result = name_map.get(idx, {})
+        suffix = name_result.get("id_suffix") or f"group-{l}"
+        # 去重 suffix
+        used_suffixes = {g["id"].split("-")[-1] for g in groups}
+        if suffix in used_suffixes:
+            suffix = f"{suffix}-{l}"
         groups.append({
-            "id": f"{category}-{meta['suffix']}",
-            "name": meta["name"],
-            "description": meta["description"],
-            "count": len(ts),
-            "tickets": ts,
+            "id": f"{category}-{suffix}",
+            "name": name_result.get("name") or f"主题{l + 1}",
+            "count": len(group_tickets),
+            "tickets": group_tickets,
         })
 
-    # 5. 收尾：合并过小组、再切过大组（LLM 拆分超大组，失败回退 embedding）
-    groups = await post_process_groups(llm, groups, embeddings, sid_to_idx, sid_to_ticket, category)
     return groups
-
-
-SUBDIVIDE_PROMPT_TEMPLATE = """以下是同一类目下、被 LLM 归为同一主题但数量过多（{count} 条）的工单。
-父主题：{parent_name}
-父主题描述：{parent_desc}
-
-需要按更细粒度（具体错误类型 / 触发场景 / 报错形式 / 子功能）拆分成 {n_parts} 个子主题。
-
-工单核心问题列表（id: 摘要）：
-{items}
-
-要求：
-1. 子主题必须比父主题更具体（不要重复父主题名）。
-2. 每个子主题至少 {gmin} 条、至多 {gmax} 条。
-3. 不要使用「其他」「其它」「综合」类宽泛名称。
-4. 子主题名 8-16 字，可用斜杠连接相关概念。
-5. 所有给出的 id 必须出现且仅出现一次。
-
-输出严格 JSON：
-{{
-  "sub_themes": [
-    {{
-      "name": "子主题名",
-      "description": "一句话描述",
-      "id_suffix": "english-kebab-case",
-      "ticket_ids": ["t3","t8",...]
-    }},
-    ...
-  ]
-}}"""
-
-
-async def llm_subdivide_group(
-    llm: LLMClient,
-    parent_name: str,
-    parent_desc: str,
-    tickets: list[dict],
-    n_parts: int,
-) -> list[dict]:
-    """让 LLM 把超大组拆成 n_parts 个子主题；失败返回 []"""
-    items = "\n".join(f"{t['_sid']}: {t['_summary']['core_issue']}" for t in tickets)
-    prompt = SUBDIVIDE_PROMPT_TEMPLATE.format(
-        count=len(tickets),
-        parent_name=parent_name,
-        parent_desc=parent_desc,
-        n_parts=n_parts,
-        items=items,
-        gmin=GROUP_MIN,
-        gmax=GROUP_MAX,
-    )
-    for attempt in range(2):
-        try:
-            content = await llm.chat(prompt, temperature=0.2, response_json=True)
-            data = parse_json_loose(content)
-            sub = data.get("sub_themes", []) if isinstance(data, dict) else data
-            return sub or []
-        except Exception as e:
-            if attempt == 1:
-                print(f"      子主题拆分失败（已重试）：{e}")
-                return []
-            await asyncio.sleep(1)
-    return []
-
-
-# ─── 阶段三：兜底（合并小组 / 切大组） ──────────────────
-
-def group_centroid(group: dict, embeddings: np.ndarray, sid_to_idx: dict) -> np.ndarray:
-    vecs = [embeddings[sid_to_idx[t["_sid"]]] for t in group["tickets"]]
-    c = np.mean(np.stack(vecs), axis=0)
-    n = np.linalg.norm(c)
-    return c / n if n > 0 else c
-
-
-async def post_process_groups(
-    llm: LLMClient,
-    groups: list[dict],
-    embeddings: np.ndarray,
-    sid_to_idx: dict,
-    sid_to_ticket: dict,
-    category: str,
-) -> list[dict]:
-    # 合并 < GROUP_MIN 的组到最相似的大组
-    changed = True
-    while changed:
-        changed = False
-        small = [g for g in groups if g["count"] < GROUP_MIN]
-        large = [g for g in groups if g["count"] >= GROUP_MIN]
-        if not small or not large:
-            break
-        large_centroids = np.stack([group_centroid(g, embeddings, sid_to_idx) for g in large])
-        for sg in small:
-            sc = group_centroid(sg, embeddings, sid_to_idx)
-            sims = large_centroids @ sc
-            target = large[int(np.argmax(sims))]
-            target["tickets"].extend(sg["tickets"])
-            target["count"] = len(target["tickets"])
-            groups.remove(sg)
-            changed = True
-            break
-
-    # 如果仍存在 < GROUP_MIN 的组（说明全是小组），合并所有
-    if groups and all(g["count"] < GROUP_MIN for g in groups):
-        merged_tickets = [t for g in groups for t in g["tickets"]]
-        groups = [{
-            "id": f"{category}-general",
-            "name": "通用问题",
-            "description": "工单较分散，未形成稳定主题",
-            "count": len(merged_tickets),
-            "tickets": merged_tickets,
-        }]
-
-    # 切超大组（> GROUP_MAX）：优先让 LLM 按更细粒度拆，失败回退到 embedding 硬切
-    final: list[dict] = []
-    for g in groups:
-        if g["count"] <= GROUP_MAX:
-            final.append(g)
-            continue
-
-        n_parts = (g["count"] + GROUP_MAX - 1) // GROUP_MAX
-        sub_groups = await _llm_split_oversized(llm, g, n_parts, category)
-        if not sub_groups:
-            sub_groups = _embedding_split_oversized(g, n_parts, embeddings, sid_to_idx)
-        # 子组若仍超大，递归再切（但深度限 1，避免死循环）
-        for sg in sub_groups:
-            if sg["count"] > GROUP_MAX:
-                sub_n = (sg["count"] + GROUP_MAX - 1) // GROUP_MAX
-                final.extend(_embedding_split_oversized(sg, sub_n, embeddings, sid_to_idx))
-            else:
-                final.append(sg)
-    return final
-
-
-async def _llm_split_oversized(llm: LLMClient, g: dict, n_parts: int, category: str) -> list[dict]:
-    """用 LLM 把超大组拆成子主题"""
-    print(f"    🪓 拆分超大组「{g['name']}」({g['count']} 条) → 目标 {n_parts} 个子主题")
-    sub_themes = await llm_subdivide_group(
-        llm, g["name"], g["description"], g["tickets"], n_parts,
-    )
-    if not sub_themes:
-        return []
-
-    # 按 sid 还原工单
-    sid_to_ticket = {t["_sid"]: t for t in g["tickets"]}
-    assigned: dict[str, int] = {}
-    for i, sub in enumerate(sub_themes):
-        for sid in sub.get("ticket_ids", []) or []:
-            sid = str(sid).strip()
-            if sid in sid_to_ticket and sid not in assigned:
-                assigned[sid] = i
-
-    # 漏分配的工单：分到子主题中数量最少的，保持均衡
-    missing = [t for t in g["tickets"] if t["_sid"] not in assigned]
-    if missing and sub_themes:
-        for t in missing:
-            counts = [sum(1 for v in assigned.values() if v == i) for i in range(len(sub_themes))]
-            assigned[t["_sid"]] = counts.index(min(counts))
-
-    sub_groups: list[dict] = []
-    for i, sub in enumerate(sub_themes):
-        bucket = [sid_to_ticket[s] for s, idx in assigned.items() if idx == i]
-        if not bucket:
-            continue
-        raw_suffix = str(sub.get("id_suffix", "")).strip() or f"sub-{i + 1}"
-        sub_groups.append({
-            "id": f"{category}-{raw_suffix}-{i + 1}",
-            "name": str(sub.get("name", "")).strip() or f"{g['name']} 子组{i + 1}",
-            "description": str(sub.get("description", "")).strip() or g["description"],
-            "count": len(bucket),
-            "tickets": bucket,
-        })
-    return sub_groups
-
-
-def _embedding_split_oversized(g: dict, n_parts: int, embeddings: np.ndarray, sid_to_idx: dict) -> list[dict]:
-    """LLM 拆分失败时的兜底：按 embedding 最远种子硬切，命名带 #N"""
-    idxs = [sid_to_idx[t["_sid"]] for t in g["tickets"]]
-    sub_embs = embeddings[idxs]
-    seeds = [0]
-    for _ in range(n_parts - 1):
-        d = np.min(1 - sub_embs @ sub_embs[seeds].T, axis=1)
-        seeds.append(int(np.argmax(d)))
-    seed_vecs = sub_embs[seeds]
-    labels = np.argmax(sub_embs @ seed_vecs.T, axis=1)
-    out: list[dict] = []
-    for k in range(n_parts):
-        sub_tickets = [g["tickets"][i] for i in range(len(g["tickets"])) if labels[i] == k]
-        if not sub_tickets:
-            continue
-        out.append({
-            "id": f"{g['id']}-p{k + 1}",
-            "name": f"{g['name']} #{k + 1}",
-            "description": g["description"],
-            "count": len(sub_tickets),
-            "tickets": sub_tickets,
-        })
-    return out
 
 
 # ─── 主流程 ─────────────────────────────────────────────
 
 async def main():
     print("=" * 60)
-    print("工单语义聚类（LLM 主导）")
+    print("工单语义聚类（Embedding + Agglomerative 聚类）")
     print("=" * 60)
 
     if not API_KEY or API_KEY == "your-api-key-here":
         raise SystemExit("未配置 OPENAI_API_KEY，无法运行")
+    if not EMBED_API_KEY:
+        raise SystemExit("未配置 EMBEDDING_API_KEY，无法运行")
 
     print("\n[1/5] 读取 Excel...")
     df = read_excel_files()
@@ -1022,14 +784,13 @@ async def main():
         print("\n[3/5] 阶段一：LLM 抽取问题摘要...")
         await summarize_all(llm, all_tickets)
 
-        print("\n[4/5] 阶段二：embedding + LLM 主题归并...")
-        # 全量 embedding（基于 core_issue + keywords）
+        print("\n[4/5] 阶段二：百度千帆 Embedding + Agglomerative 聚类...")
+        # embedding 输入：LLM 摘要（core_issue），信息精炼且保留区分度
         embed_texts = [
-            (t["_summary"]["core_issue"] + " " + " ".join(t["_summary"].get("keywords", []) or [])).strip()
-            or extract_raw_text(t) or t["title"] or "无内容"
+            t["_summary"]["core_issue"] or extract_embed_text(t) or t["title"] or "无内容"
             for t in all_tickets
         ]
-        embeddings = compute_embeddings_cached(embed_texts)
+        embeddings = await compute_embeddings_api(llm, embed_texts)
 
         # 按一级分类分组：小分类（< GROUP_MIN）合并到「其他」，避免丢数据
         category_map: dict[str, list[int]] = {}
@@ -1041,7 +802,6 @@ async def main():
         if small_cats:
             merged = [i for v in small_cats.values() for i in v]
             other_key = "其他"
-            # 若已存在「其他」分类，则合并到一起
             big_cats.setdefault(other_key, []).extend(merged)
             print(f"  小分类（<{GROUP_MIN}条）共 {len(small_cats)} 个、{len(merged)} 条 → 并入「{other_key}」: "
                   + ", ".join(f"{k}({len(v)})" for k, v in small_cats.items()))
@@ -1050,13 +810,11 @@ async def main():
 
         sorted_cats = sorted(category_map.items(), key=lambda x: -len(x[1]))
 
-        cluster_cache = load_cluster_cache()
-
         async def run_category(cat_name: str, idxs: list[int]):
             sub_tickets = [all_tickets[i] for i in idxs]
             sub_embs = embeddings[idxs]
             print(f"    启动分类: {cat_name} ({len(sub_tickets)} 条)")
-            groups = await cluster_category_llm(llm, cat_name, sub_tickets, sub_embs, cluster_cache)
+            groups = await cluster_category(llm, cat_name, sub_tickets, sub_embs)
             for g in groups:
                 g["tickets"].sort(key=lambda t: t.get("feedbackTime", ""), reverse=True)
             print(f"    完成分类: {cat_name} → {len(groups)} 组")
@@ -1067,12 +825,11 @@ async def main():
                 "groups": groups,
             }
 
-        # 所有一级分类并发跑（共享 LLM 信号量做实际限流）；单个分类失败不影响其他
+        # 所有一级分类并发跑（共享 LLM 信号量做实际限流）
         results = await asyncio.gather(
             *(run_category(c, ix) for c, ix in sorted_cats),
             return_exceptions=True,
         )
-        save_cluster_cache(cluster_cache)
         categories = []
         for (cat_name, _), r in zip(sorted_cats, results):
             if isinstance(r, Exception):
@@ -1115,10 +872,8 @@ async def main():
 
     for c in categories:
         sizes = [g["count"] for g in c["groups"]]
-        over = sum(1 for s in sizes if s > GROUP_MAX)
-        under = sum(1 for s in sizes if s < GROUP_MIN)
-        flag = f" ⚠️ 超大={over}, 超小={under}" if (over or under) else ""
-        print(f"  {c['id']}: {len(sizes)} 组{flag}")
+        size_str = ", ".join(str(s) for s in sorted(sizes, reverse=True))
+        print(f"  {c['id']}: {len(sizes)} 组 [{size_str}]")
 
 
 if __name__ == "__main__":

@@ -2,21 +2,23 @@
 
 基于 LLM 语义聚类的工单分析系统，包含数据处理和前端可视化两部分。
 
-- **data-process**：Python 后端，读取 Excel 工单数据，通过 LLM + Embedding 进行语义聚类，输出 JSON
+- **data-process**：Python 后端，读取 Excel 工单数据，通过 LLM 摘要 + 百度千帆 Embedding + Agglomerative 聚类，输出 JSON
 - **前端**：React + Vite + Tailwind，以分类/主题/工单三级结构展示聚类结果，支持搜索、筛选、会话详情查看
 
 ## 前置准备
 
 1. **放置数据文件**：将 Excel 工单文件放入 `data/` 目录，替换前请先删除旧文件
-2. **配置 LLM API**：
+2. **配置 API**：
    ```bash
    cd data-process
    cp .env.example .env
-   # 编辑 .env，填入 OPENAI_API_KEY 和 OPENAI_BASE_URL
-   ```
-3. **Embedding 模型**：默认使用 `BAAI/bge-small-zh-v1.5`（本地运行，首次自动下载），国内下载慢可设置镜像：
-   ```bash
-   export HF_ENDPOINT=https://hf-mirror.com
+   # 编辑 .env，填入以下配置：
+   #   OPENAI_API_KEY    — LLM API Key（用于摘要和命名）
+   #   OPENAI_BASE_URL   — LLM API Base URL
+   #   OPENAI_MODEL      — 摘要模型（默认 GLM-5.1）
+   #   NAME_MODEL        — 命名模型（可与摘要模型不同）
+   #   EMBEDDING_API_KEY — 百度千帆 Embedding API Key
+   #   EMBEDDING_URL     — 百度千帆 Embedding API URL
    ```
 
 ## 快速开始
@@ -35,7 +37,7 @@ cd data-process
 
 # 配置环境变量
 cp .env.example .env
-# 编辑 .env 填入 OPENAI_API_KEY 等配置
+# 编辑 .env 填入 API Key 等配置
 
 # 安装依赖
 uv sync
@@ -59,13 +61,14 @@ pnpm dev
 pnpm build
 ```
 
-前端会读取 根目录`ticket_data.json` 进行展示。
+前端会读取根目录 `ticket_data.json` 进行展示。
 
 ## 环境要求
 
 - Node.js 18+ & pnpm
 - Python 3.9+ & [uv](https://docs.astral.sh/uv/)
 - LLM API（兼容 OpenAI 接口格式）
+- 百度千帆 Embedding API
 
 ## 项目结构
 
@@ -90,8 +93,8 @@ pnpm build
 
 `cluster.py` 分三阶段处理：
 
-1. **LLM 抽取摘要**：为每条工单生成核心问题摘要和关键词
-2. **Embedding + LLM 归并**：本地 Embedding 预聚合 → LLM 主题归并 → 跨块去重
-3. **兜底处理**：合并小组、拆分超大组
+1. **LLM 抽取摘要**：为每条工单从标题+现象+提问者消息中抽取核心问题摘要（core_issue），要求包含产品/功能+场景+问题
+2. **百度千帆 Embedding + Agglomerative 聚类**：对摘要做 embedding，按一级分类分组后用 Agglomerative 层次聚类，再合并相似簇
+3. **LLM 命名**：批量为每个簇生成精准标题（可使用不同模型）
 
 所有中间结果均有本地缓存（`.cache/`），支持断点续跑。

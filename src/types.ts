@@ -24,7 +24,6 @@ export interface Ticket {
 export interface Group {
   id: string;
   name: string;
-  description: string;
   count: number;
   tickets: Ticket[];
 }
