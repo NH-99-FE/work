@@ -43,10 +43,13 @@ work/
 │   ├── cluster.py
 │   └── .cache/                 # 中间缓存
 └── public/
-    └── ticket_data.json        # 输出
+    ├── ticket_data.json        # 输出：工单列表（不含会话消息，约 1.4MB）
+    └── ticket_messages.json    # 输出：会话消息索引（按需加载，约 8MB）
 ```
 
-输出：`../public/ticket_data.json`
+输出：
+- `../public/ticket_data.json` — 工单列表数据（分类 → 主题 → 工单），不含 messages，首屏加载
+- `../public/ticket_messages.json` — 会话消息索引（`{ticket_id: messages}`），前端按需加载
 
 ## 处理流程
 
