@@ -849,6 +849,9 @@ async def main():
     all_ticket_types = sorted(set(t["ticketType"] for t in all_tickets if t["ticketType"]))
     total_groups = sum(len(c["groups"]) for c in categories)
 
+    # 构建 messages 索引：{ticket_id: messages}
+    messages_map = {t["id"]: t.pop("messages") for t in all_tickets}
+
     result = {
         "summary": {
             "totalTickets": len(all_tickets),
@@ -862,6 +865,11 @@ async def main():
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
+
+    # 输出 messages 索引文件
+    MESSAGES_PATH = OUTPUT_PATH.parent / "ticket_messages.json"
+    with open(MESSAGES_PATH, "w", encoding="utf-8") as f:
+        json.dump(messages_map, f, ensure_ascii=False, indent=2)
 
     group_sizes = [g["count"] for c in categories for g in c["groups"]]
     print(f"\n{'=' * 60}")

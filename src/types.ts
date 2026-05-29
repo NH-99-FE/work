@@ -18,7 +18,7 @@ export interface Ticket {
   responseTime: string;
   processDuration: string;
   ticketType: string;
-  messages: TicketMessage[];
+  messages?: TicketMessage[];  // 按需加载，首屏不含
 }
 
 export interface Group {

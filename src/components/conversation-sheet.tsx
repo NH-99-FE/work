@@ -1,4 +1,4 @@
-import { User, Clock, AlertTriangle } from 'lucide-react';
+import { User, Clock, AlertTriangle, Loader2 } from 'lucide-react';
 import {
   Sheet,
   SheetContent,
@@ -7,6 +7,7 @@ import {
   SheetDescription,
 } from '@/components/ui/sheet';
 import { MessageContent } from '@/components/message-content';
+import { useTicketMessages } from '@/hooks/use-ticket-data';
 import type { Ticket } from '@/types';
 
 function formatTime(t: string) {
@@ -20,10 +21,14 @@ export function ConversationSheet({ ticket, open, onOpenChange, onPreviewImage }
   onOpenChange: (open: boolean) => void;
   onPreviewImage: (url: string) => void;
 }) {
+  const { messages, loading: messagesLoading } = useTicketMessages(open ? ticket?.id ?? null : null);
+
   if (!ticket) return null;
 
   // 第一个非 robot 发言的人是用户，其余 user 是客服
-  const firstSender = ticket.messages.find(m => m.role !== 'robot')?.sender;  return (
+  const firstSender = messages.find(m => m.role !== 'robot')?.sender;
+
+  return (
     <Sheet open={open} onOpenChange={onOpenChange}>
       <SheetContent
         side="right"
@@ -53,10 +58,14 @@ export function ConversationSheet({ ticket, open, onOpenChange, onPreviewImage }
         )}
 
         <div className="px-5 py-4">
-          {ticket.messages.length === 0 ? (
+          {messagesLoading ? (
+            <div className="text-center py-10 text-gray-400">
+              <Loader2 className="inline animate-spin mr-2" size={16} />加载会话中...
+            </div>
+          ) : messages.length === 0 ? (
             <div className="text-center py-10 text-gray-400">暂无会话记录</div>
           ) : (
-            ticket.messages.map((msg, idx) => {
+            messages.map((msg, idx) => {
               const isUser = msg.role === 'user' && (msg.sender === firstSender);
               return (
                 <div key={idx} className={`flex flex-col ${isUser ? 'items-start' : 'items-end'} mb-3`}>

@@ -28,3 +28,4 @@ data
 ticket_data.json
 public/ticket_data.json
 ticket_analysis.html
+ticket_messages.json
