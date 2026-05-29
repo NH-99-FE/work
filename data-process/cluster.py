@@ -35,10 +35,7 @@ SUMMARY_CACHE = CACHE_DIR / "summaries.json"
 EMBED_CACHE = CACHE_DIR / "embeddings.npz"
 CLUSTER_CACHE = CACHE_DIR / "clusters.json"
 
-EXCEL_FILES = [
-    EXCEL_DIR / "人工.xlsx",
-    EXCEL_DIR / "工单数据汇总_时间范围2026-05-11 00_00_00至2026-05-27 23_59_59 (1).xlsx",
-]
+EXCEL_FILES = sorted(EXCEL_DIR.glob("*.xlsx"))
 
 SHEET_NAME = "工单数据"
 
@@ -65,6 +62,9 @@ HTTP_MAX_CONNECTIONS = 50 # httpx 连接池上限
 # ─── 数据读取 ───────────────────────────────────────────
 
 def read_excel_files() -> pd.DataFrame:
+    if not EXCEL_FILES:
+        print(f"\n❌ data/ 目录中没有找到 xlsx 文件，请将需要处理的 Excel 工单文件放入 {EXCEL_DIR} 目录后重试。\n")
+        raise SystemExit(1)
     dfs = []
     for f in EXCEL_FILES:
         if f.exists():
